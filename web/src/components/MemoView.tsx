@@ -1,25 +1,24 @@
 import { BookmarkIcon, EyeOffIcon, MessageCircleMoreIcon } from "lucide-react";
 import { observer } from "mobx-react-lite";
-import { memo, useCallback, useState } from "react";
+import { memo, useCallback, useEffect, useRef, useState } from "react";
+import toast from "react-hot-toast";
 import { Link, useLocation } from "react-router-dom";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import useAsyncEffect from "@/hooks/useAsyncEffect";
 import useCurrentUser from "@/hooks/useCurrentUser";
 import useNavigateTo from "@/hooks/useNavigateTo";
 import { cn } from "@/lib/utils";
-import { memoStore, userStore, workspaceStore } from "@/store";
+import { instanceStore, memoStore, userStore } from "@/store";
 import { State } from "@/types/proto/api/v1/common";
 import { Memo, MemoRelation_Type, Visibility } from "@/types/proto/api/v1/memo_service";
 import { useTranslate } from "@/utils/i18n";
 import { convertVisibilityToString } from "@/utils/memo";
 import { isSuperUser } from "@/utils/user";
 import MemoActionMenu from "./MemoActionMenu";
-import MemoAttachmentListView from "./MemoAttachmentListView";
 import MemoContent from "./MemoContent";
 import MemoEditor from "./MemoEditor";
-import MemoLocationView from "./MemoLocationView";
 import MemoReactionistView from "./MemoReactionListView";
-import MemoRelationListView from "./MemoRelationListView";
+import { AttachmentList, LocationDisplay, RelationList } from "./memo-metadata";
 import PreviewImageDialog from "./PreviewImageDialog";
 import ReactionSelector from "./ReactionSelector";
 import UserAvatar from "./UserAvatar";
@@ -46,12 +45,15 @@ const MemoView: React.FC<Props> = observer((props: Props) => {
   const [showEditor, setShowEditor] = useState<boolean>(false);
   const [creator, setCreator] = useState(userStore.getUserByName(memo.creator));
   const [showNSFWContent, setShowNSFWContent] = useState(props.showNsfwContent);
+  const [reactionSelectorOpen, setReactionSelectorOpen] = useState<boolean>(false);
   const [previewImage, setPreviewImage] = useState<{ open: boolean; urls: string[]; index: number }>({
     open: false,
     urls: [],
     index: 0,
   });
-  const workspaceMemoRelatedSetting = workspaceStore.state.memoRelatedSetting;
+  const [shortcutActive, setShortcutActive] = useState(false);
+  const cardRef = useRef<HTMLDivElement>(null);
+  const instanceMemoRelatedSetting = instanceStore.state.memoRelatedSetting;
   const referencedMemos = memo.relations.filter((relation) => relation.type === MemoRelation_Type.REFERENCE);
   const commentAmount = memo.relations.filter(
     (relation) => relation.type === MemoRelation_Type.COMMENT && relation.relatedMemo?.name === memo.name,
@@ -62,8 +64,8 @@ const MemoView: React.FC<Props> = observer((props: Props) => {
   const isInMemoDetailPage = location.pathname.startsWith(`/${memo.name}`);
   const parentPage = props.parentPage || location.pathname;
   const nsfw =
-    workspaceMemoRelatedSetting.enableBlurNsfwContent &&
-    memo.tags?.some((tag) => workspaceMemoRelatedSetting.nsfwTags.some((nsfwTag) => tag === nsfwTag || tag.startsWith(`${nsfwTag}/`)));
+    instanceMemoRelatedSetting.enableBlurNsfwContent &&
+    memo.tags?.some((tag) => instanceMemoRelatedSetting.nsfwTags.some((nsfwTag) => tag === nsfwTag || tag.startsWith(`${nsfwTag}/`)));
 
   // Initial related data: creator.
   useAsyncEffect(async () => {
@@ -83,6 +85,13 @@ const MemoView: React.FC<Props> = observer((props: Props) => {
     const targetEl = e.target as HTMLElement;
 
     if (targetEl.tagName === "IMG") {
+      // Check if the image is inside a link
+      const linkElement = targetEl.closest("a");
+      if (linkElement) {
+        // If image is inside a link, only navigate to the link (don't show preview)
+        return;
+      }
+
       const imgUrl = targetEl.getAttribute("src");
       if (imgUrl) {
         setPreviewImage({ open: true, urls: [imgUrl], index: 0 });
@@ -95,7 +104,7 @@ const MemoView: React.FC<Props> = observer((props: Props) => {
       return;
     }
 
-    if (workspaceMemoRelatedSetting.enableDoubleClickEdit) {
+    if (instanceMemoRelatedSetting.enableDoubleClickEdit) {
       e.preventDefault();
       setShowEditor(true);
     }
@@ -118,6 +127,89 @@ const MemoView: React.FC<Props> = observer((props: Props) => {
     }
   };
 
+  const archiveMemo = useCallback(async () => {
+    if (isArchived) {
+      return;
+    }
+
+    try {
+      await memoStore.updateMemo(
+        {
+          name: memo.name,
+          state: State.ARCHIVED,
+        },
+        ["state"],
+      );
+      toast.success(t("message.archived-successfully"));
+      userStore.setStatsStateId();
+    } catch (error: any) {
+      console.error(error);
+      toast.error(error?.details);
+    }
+  }, [isArchived, memo.name, t, memoStore, userStore]);
+
+  useEffect(() => {
+    if (!shortcutActive || readonly || showEditor || !cardRef.current) {
+      return;
+    }
+
+    const cardEl = cardRef.current;
+    const isTextInputElement = (element: HTMLElement | null) => {
+      if (!element) {
+        return false;
+      }
+      if (element.isContentEditable) {
+        return true;
+      }
+      if (element instanceof HTMLTextAreaElement) {
+        return true;
+      }
+
+      if (element instanceof HTMLInputElement) {
+        const textTypes = ["text", "search", "email", "password", "url", "tel", "number"];
+        return textTypes.includes(element.type || "text");
+      }
+
+      return false;
+    };
+
+    const handleKeyDown = (event: KeyboardEvent) => {
+      const target = event.target as HTMLElement | null;
+      if (!cardEl.contains(target) || isTextInputElement(target)) {
+        return;
+      }
+
+      if (event.metaKey || event.ctrlKey || event.altKey) {
+        return;
+      }
+
+      const key = event.key.toLowerCase();
+      if (key === "e") {
+        event.preventDefault();
+        setShowEditor(true);
+      } else if (key === "a" && !isArchived) {
+        event.preventDefault();
+        archiveMemo();
+      }
+    };
+
+    cardEl.addEventListener("keydown", handleKeyDown);
+    return () => cardEl.removeEventListener("keydown", handleKeyDown);
+  }, [shortcutActive, readonly, showEditor, isArchived, archiveMemo]);
+
+  useEffect(() => {
+    if (showEditor || readonly) {
+      setShortcutActive(false);
+    }
+  }, [showEditor, readonly]);
+
+  const handleShortcutActivation = (active: boolean) => {
+    if (readonly) {
+      return;
+    }
+    setShortcutActive(active);
+  };
+
   const displayTime = isArchived ? (
     memo.displayTime?.toLocaleString()
   ) : (
@@ -136,9 +228,14 @@ const MemoView: React.FC<Props> = observer((props: Props) => {
   ) : (
     <div
       className={cn(
-        "relative flex flex-col justify-start items-start bg-card w-full px-4 py-3 mb-2 gap-2 text-card-foreground rounded-lg border border-border transition-colors",
+        "relative group flex flex-col justify-start items-start bg-card w-full px-4 py-3 mb-2 gap-2 text-card-foreground rounded-lg border border-border transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
+        shortcutActive && !showEditor && "border-ring ring-2 ring-ring bg-accent/10",
         className,
       )}
+      ref={cardRef}
+      tabIndex={readonly ? -1 : 0}
+      onFocus={() => handleShortcutActivation(true)}
+      onBlur={() => handleShortcutActivation(false)}
     >
       <div className="w-full flex flex-row justify-between items-center gap-2">
         <div className="w-auto max-w-[calc(100%-8rem)] grow flex flex-row justify-start items-center">
@@ -177,22 +274,19 @@ const MemoView: React.FC<Props> = observer((props: Props) => {
           )}
         </div>
         <div className="flex flex-row justify-end items-center select-none shrink-0 gap-2">
-          <div className="w-auto flex flex-row justify-between items-center gap-2">
-            {props.showVisibility && memo.visibility !== Visibility.PRIVATE && (
-              <Tooltip>
-                <TooltipTrigger>
-                  <span className="flex justify-center items-center rounded-md p-1 hover:opacity-80">
-                    <VisibilityIcon visibility={memo.visibility} />
-                  </span>
-                </TooltipTrigger>
-                <TooltipContent>{t(`memo.visibility.${convertVisibilityToString(memo.visibility).toLowerCase()}` as any)}</TooltipContent>
-              </Tooltip>
-            )}
-            {currentUser && !isArchived && <ReactionSelector className="border-none w-auto h-auto" memo={memo} />}
-          </div>
-          {!isInMemoDetailPage && commentAmount > 0 && (
+          {currentUser && !isArchived && (
+            <ReactionSelector
+              className={cn("border-none w-auto h-auto", reactionSelectorOpen && "!block", "hidden group-hover:block")}
+              memo={memo}
+              onOpenChange={setReactionSelectorOpen}
+            />
+          )}
+          {!isInMemoDetailPage && (
             <Link
-              className={cn("flex flex-row justify-start items-center rounded-md p-1 hover:opacity-80", commentAmount === 0 && "invisible")}
+              className={cn(
+                "flex flex-row justify-start items-center rounded-md p-1 hover:opacity-80",
+                commentAmount === 0 && "invisible group-hover:visible",
+              )}
               to={`/${memo.name}#comments`}
               viewTransition
               state={{
@@ -202,6 +296,16 @@ const MemoView: React.FC<Props> = observer((props: Props) => {
               <MessageCircleMoreIcon className="w-4 h-4 mx-auto text-muted-foreground" />
               {commentAmount > 0 && <span className="text-xs text-muted-foreground">{commentAmount}</span>}
             </Link>
+          )}
+          {props.showVisibility && memo.visibility !== Visibility.PRIVATE && (
+            <Tooltip>
+              <TooltipTrigger>
+                <span className="flex justify-center items-center rounded-md hover:opacity-80">
+                  <VisibilityIcon visibility={memo.visibility} />
+                </span>
+              </TooltipTrigger>
+              <TooltipContent>{t(`memo.visibility.${convertVisibilityToString(memo.visibility).toLowerCase()}` as any)}</TooltipContent>
+            </Tooltip>
           )}
           {props.showPinned && memo.pinned && (
             <TooltipProvider>
@@ -234,16 +338,16 @@ const MemoView: React.FC<Props> = observer((props: Props) => {
         <MemoContent
           key={`${memo.name}-${memo.updateTime}`}
           memoName={memo.name}
-          nodes={memo.nodes}
+          content={memo.content}
           readonly={readonly}
           onClick={handleMemoContentClick}
           onDoubleClick={handleMemoContentDoubleClick}
           compact={memo.pinned ? false : props.compact} // Always show full content when pinned.
           parentPage={parentPage}
         />
-        {memo.location && <MemoLocationView location={memo.location} />}
-        <MemoAttachmentListView attachments={memo.attachments} />
-        <MemoRelationListView memo={memo} relations={referencedMemos} parentPage={parentPage} />
+        {memo.location && <LocationDisplay mode="view" location={memo.location} />}
+        <AttachmentList mode="view" attachments={memo.attachments} />
+        <RelationList mode="view" relations={referencedMemos} currentMemoName={memo.name} parentPage={parentPage} />
         <MemoReactionistView memo={memo} reactions={memo.reactions} />
       </div>
       {nsfw && !showNSFWContent && (

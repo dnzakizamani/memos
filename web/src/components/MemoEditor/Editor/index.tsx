@@ -1,12 +1,23 @@
-import { last } from "lodash-es";
 import { forwardRef, ReactNode, useCallback, useEffect, useImperativeHandle, useRef, useState } from "react";
-import { markdownServiceClient } from "@/grpcweb";
 import { cn } from "@/lib/utils";
-import { Node, NodeType, OrderedListItemNode, TaskListItemNode, UnorderedListItemNode } from "@/types/proto/api/v1/markdown_service";
 import { Command } from "../types/command";
 import CommandSuggestions from "./CommandSuggestions";
-import TagSuggestions from "./TagSuggestions";
 import { editorCommands } from "./commands";
+import TagSuggestions from "./TagSuggestions";
+import { useListAutoCompletion } from "./useListAutoCompletion";
+
+/**
+ * Editor height constraints
+ * - Normal mode: Limited to 50% viewport height to avoid excessive scrolling
+ * - Focus mode: Minimum 50vh on mobile, 60vh on desktop for immersive writing
+ */
+const EDITOR_HEIGHT = {
+  normal: "max-h-[50vh]",
+  focusMode: {
+    mobile: "min-h-[50vh]",
+    desktop: "md:min-h-[60vh]",
+  },
+} as const;
 
 export interface EditorRefActions {
   getEditor: () => HTMLTextAreaElement | null;
@@ -32,10 +43,12 @@ interface Props {
   commands?: Command[];
   onContentChange: (content: string) => void;
   onPaste: (event: React.ClipboardEvent) => void;
+  /** Whether Focus Mode is active - adjusts height constraints for immersive writing */
+  isFocusMode?: boolean;
 }
 
 const Editor = forwardRef(function Editor(props: Props, ref: React.ForwardedRef<EditorRefActions>) {
-  const { className, initialContent, placeholder, onPaste, onContentChange: handleContentChangeCallback } = props;
+  const { className, initialContent, placeholder, onPaste, onContentChange: handleContentChangeCallback, isFocusMode } = props;
   const [isInIME, setIsInIME] = useState(false);
   const editorRef = useRef<HTMLTextAreaElement>(null);
 
@@ -154,78 +167,31 @@ const Editor = forwardRef(function Editor(props: Props, ref: React.ForwardedRef<
     updateEditorHeight();
   }, []);
 
-  const getLastNode = (nodes: Node[]): Node | undefined => {
-    const lastNode = last(nodes);
-    if (!lastNode) {
-      return undefined;
-    }
-    if (lastNode.type === NodeType.LIST) {
-      const children = lastNode.listNode?.children;
-      if (children) {
-        return getLastNode(children);
-      }
-    }
-    return lastNode;
-  };
-
-  const handleEditorKeyDown = async (event: React.KeyboardEvent<HTMLTextAreaElement>) => {
-    if (event.key === "Enter" && !isInIME) {
-      if (event.shiftKey || event.ctrlKey || event.metaKey || event.altKey) {
-        return;
-      }
-
-      const cursorPosition = editorActions.getCursorPosition();
-      const prevContent = editorActions.getContent().substring(0, cursorPosition);
-      const { nodes } = await markdownServiceClient.parseMarkdown({ markdown: prevContent });
-      const lastNode = getLastNode(nodes);
-      if (!lastNode) {
-        return;
-      }
-
-      // Get the indentation of the previous line
-      const lines = prevContent.split("\n");
-      const lastLine = lines[lines.length - 1];
-      const indentationMatch = lastLine.match(/^\s*/);
-      let insertText = indentationMatch ? indentationMatch[0] : ""; // Keep the indentation of the previous line
-      if (lastNode.type === NodeType.TASK_LIST_ITEM) {
-        const { symbol } = lastNode.taskListItemNode as TaskListItemNode;
-        insertText += `${symbol} [ ] `;
-      } else if (lastNode.type === NodeType.UNORDERED_LIST_ITEM) {
-        const { symbol } = lastNode.unorderedListItemNode as UnorderedListItemNode;
-        insertText += `${symbol} `;
-      } else if (lastNode.type === NodeType.ORDERED_LIST_ITEM) {
-        const { number } = lastNode.orderedListItemNode as OrderedListItemNode;
-        insertText += `${Number(number) + 1}. `;
-      } else if (lastNode.type === NodeType.TABLE) {
-        const columns = lastNode.tableNode?.header.length;
-        if (!columns) {
-          return;
-        }
-
-        insertText += "| ";
-        for (let i = 1; i < columns; i++) {
-          insertText += " | ";
-        }
-        insertText += " |";
-      }
-
-      if (insertText) {
-        // Insert the text at the current cursor position.
-        editorActions.insertText(insertText);
-      }
-    }
-  };
+  // Auto-complete markdown lists when pressing Enter
+  useListAutoCompletion({
+    editorRef,
+    editorActions,
+    isInIME,
+  });
 
   return (
-    <div className={cn("flex flex-col justify-start items-start relative w-full h-auto max-h-[50vh] bg-inherit", className)}>
+    <div
+      className={cn(
+        "flex flex-col justify-start items-start relative w-full h-auto bg-inherit",
+        isFocusMode ? "flex-1" : EDITOR_HEIGHT.normal,
+        className,
+      )}
+    >
       <textarea
-        className="w-full h-full my-1 text-base resize-none overflow-x-hidden overflow-y-auto bg-transparent outline-none placeholder:opacity-70 whitespace-pre-wrap break-words"
+        className={cn(
+          "w-full my-1 text-base resize-none overflow-x-hidden overflow-y-auto bg-transparent outline-none placeholder:opacity-70 whitespace-pre-wrap break-words",
+          isFocusMode ? `h-auto ${EDITOR_HEIGHT.focusMode.mobile} ${EDITOR_HEIGHT.focusMode.desktop}` : "h-full",
+        )}
         rows={1}
         placeholder={placeholder}
         ref={editorRef}
         onPaste={onPaste}
         onInput={handleEditorInput}
-        onKeyDown={handleEditorKeyDown}
         onCompositionStart={() => setIsInIME(true)}
         onCompositionEnd={() => setTimeout(() => setIsInIME(false))}
       ></textarea>

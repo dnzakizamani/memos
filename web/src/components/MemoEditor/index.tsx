@@ -1,37 +1,59 @@
 import copy from "copy-to-clipboard";
 import { isEqual } from "lodash-es";
-import { LoaderIcon } from "lucide-react";
+import { LoaderIcon, Minimize2Icon } from "lucide-react";
 import { observer } from "mobx-react-lite";
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { toast } from "react-hot-toast";
 import { useTranslation } from "react-i18next";
 import useLocalStorage from "react-use/lib/useLocalStorage";
-import VisibilityIcon from "@/components/VisibilityIcon";
 import { Button } from "@/components/ui/button";
-import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
 import { memoServiceClient } from "@/grpcweb";
 import { TAB_SPACE_WIDTH } from "@/helpers/consts";
 import { isValidUrl } from "@/helpers/utils";
 import useAsyncEffect from "@/hooks/useAsyncEffect";
 import useCurrentUser from "@/hooks/useCurrentUser";
 import { cn } from "@/lib/utils";
-import { memoStore, attachmentStore, userStore, workspaceStore } from "@/store";
+import { attachmentStore, instanceStore, memoStore, userStore } from "@/store";
 import { extractMemoIdFromName } from "@/store/common";
 import { Attachment } from "@/types/proto/api/v1/attachment_service";
 import { Location, Memo, MemoRelation, MemoRelation_Type, Visibility } from "@/types/proto/api/v1/memo_service";
 import { useTranslate } from "@/utils/i18n";
 import { convertVisibilityFromString } from "@/utils/memo";
 import DateTimeInput from "../DateTimeInput";
-import AddMemoRelationPopover from "./ActionButton/AddMemoRelationPopover";
-import LocationSelector from "./ActionButton/LocationSelector";
-import MarkdownMenu from "./ActionButton/MarkdownMenu";
-import TagSelector from "./ActionButton/TagSelector";
-import UploadAttachmentButton from "./ActionButton/UploadAttachmentButton";
-import AttachmentListView from "./AttachmentListView";
+import { AttachmentList, LocationDisplay, RelationList } from "../memo-metadata";
+import InsertMenu from "./ActionButton/InsertMenu";
+import VisibilitySelector from "./ActionButton/VisibilitySelector";
 import Editor, { EditorRefActions } from "./Editor";
-import RelationListView from "./RelationListView";
 import { handleEditorKeydownWithMarkdownShortcuts, hyperlinkHighlightedText } from "./handlers";
 import { MemoEditorContext } from "./types";
+
+/**
+ * Focus Mode keyboard shortcuts
+ * - Toggle: Cmd/Ctrl + Shift + F (matches GitHub, Google Docs convention)
+ * - Exit: Escape key
+ */
+const FOCUS_MODE_TOGGLE_KEY = "f";
+const FOCUS_MODE_EXIT_KEY = "Escape";
+
+/**
+ * Focus Mode styling constants
+ * Centralized to make it easy to adjust the appearance and maintain consistency
+ */
+const FOCUS_MODE_STYLES = {
+  backdrop: "fixed inset-0 bg-black/20 backdrop-blur-sm z-40",
+  container: {
+    base: "fixed z-50 w-auto max-w-5xl mx-auto shadow-2xl border-border h-auto overflow-y-auto",
+    /**
+     * Responsive spacing using explicit positioning to avoid width conflicts:
+     * - Mobile (< 640px): 8px margin (0.5rem)
+     * - Tablet (640-768px): 16px margin (1rem)
+     * - Desktop (> 768px): 32px margin (2rem)
+     */
+    spacing: "top-2 left-2 right-2 bottom-2 sm:top-4 sm:left-4 sm:right-4 sm:bottom-4 md:top-8 md:left-8 md:right-8 md:bottom-8",
+  },
+  transition: "transition-all duration-300 ease-in-out",
+  exitButton: "absolute top-2 right-2 z-10 opacity-60 hover:opacity-100",
+} as const;
 
 export interface Props {
   className?: string;
@@ -55,6 +77,8 @@ interface State {
   isRequesting: boolean;
   isComposing: boolean;
   isDraggingFile: boolean;
+  /** Whether Focus Mode (distraction-free writing) is enabled */
+  isFocusMode: boolean;
 }
 
 const MemoEditor = observer((props: Props) => {
@@ -64,6 +88,7 @@ const MemoEditor = observer((props: Props) => {
   const currentUser = useCurrentUser();
   const [state, setState] = useState<State>({
     memoVisibility: Visibility.PRIVATE,
+    isFocusMode: false,
     attachmentList: [],
     relationList: [],
     location: undefined,
@@ -85,7 +110,7 @@ const MemoEditor = observer((props: Props) => {
           relation.memo?.name === memoName && relation.relatedMemo?.name !== memoName && relation.type === MemoRelation_Type.REFERENCE,
       )
     : state.relationList.filter((relation) => relation.type === MemoRelation_Type.REFERENCE);
-  const workspaceMemoRelatedSetting = workspaceStore.state.memoRelatedSetting;
+  const instanceMemoRelatedSetting = instanceStore.state.memoRelatedSetting;
 
   useEffect(() => {
     editorRef.current?.setContent(contentCache || "");
@@ -99,7 +124,7 @@ const MemoEditor = observer((props: Props) => {
 
   useAsyncEffect(async () => {
     let visibility = convertVisibilityFromString(userGeneralSetting?.memoVisibility || "PRIVATE");
-    if (workspaceMemoRelatedSetting.disallowPublicVisibility && visibility === Visibility.PUBLIC) {
+    if (instanceMemoRelatedSetting.disallowPublicVisibility && visibility === Visibility.PUBLIC) {
       visibility = Visibility.PROTECTED;
     }
     if (parentMemoName) {
@@ -110,7 +135,7 @@ const MemoEditor = observer((props: Props) => {
       ...prevState,
       memoVisibility: convertVisibilityFromString(visibility),
     }));
-  }, [parentMemoName, userGeneralSetting?.memoVisibility, workspaceMemoRelatedSetting.disallowPublicVisibility]);
+  }, [parentMemoName, userGeneralSetting?.memoVisibility, instanceMemoRelatedSetting.disallowPublicVisibility]);
 
   useAsyncEffect(async () => {
     if (!memoName) {
@@ -155,12 +180,33 @@ const MemoEditor = observer((props: Props) => {
     }
 
     const isMetaKey = event.ctrlKey || event.metaKey;
+
+    // Focus Mode toggle: Cmd/Ctrl + Shift + F
+    if (isMetaKey && event.shiftKey && event.key.toLowerCase() === FOCUS_MODE_TOGGLE_KEY) {
+      event.preventDefault();
+      toggleFocusMode();
+      return;
+    }
+
+    // Exit Focus Mode: Escape
+    if (event.key === FOCUS_MODE_EXIT_KEY && state.isFocusMode) {
+      event.preventDefault();
+      toggleFocusMode();
+      return;
+    }
+
     if (isMetaKey) {
       if (event.key === "Enter") {
+        event.preventDefault();
         handleSaveBtnClick();
         return;
       }
-      if (!workspaceMemoRelatedSetting.disableMarkdownShortcuts) {
+      if (event.key.toLowerCase() === "s") {
+        event.preventDefault();
+        handleSaveBtnClick();
+        return;
+      }
+      if (!instanceMemoRelatedSetting.disableMarkdownShortcuts) {
         handleEditorKeydownWithMarkdownShortcuts(event, editorRef.current);
       }
     }
@@ -175,6 +221,21 @@ const MemoEditor = observer((props: Props) => {
       }
       return;
     }
+  };
+
+  /**
+   * Toggle Focus Mode on/off
+   * Focus Mode provides a distraction-free writing experience with:
+   * - Expanded editor taking ~80-90% of viewport
+   * - Semi-transparent backdrop
+   * - Centered layout with optimal width
+   * - All editor functionality preserved
+   */
+  const toggleFocusMode = () => {
+    setState((prevState) => ({
+      ...prevState,
+      isFocusMode: !prevState.isFocusMode,
+    }));
   };
 
   const handleMemoVisibilityChange = (visibility: Visibility) => {
@@ -395,10 +456,7 @@ const MemoEditor = observer((props: Props) => {
                 relations: state.relationList,
                 location: state.location,
               }),
-              // Optional fields can be omitted
               memoId: "",
-              validateOnly: false,
-              requestId: "",
             })
           : memoServiceClient
               .createMemoComment({
@@ -455,8 +513,9 @@ const MemoEditor = observer((props: Props) => {
       placeholder: props.placeholder ?? t("editor.any-thoughts"),
       onContentChange: handleContentChange,
       onPaste: handlePasteEvent,
+      isFocusMode: state.isFocusMode,
     }),
-    [i18n.language],
+    [i18n.language, state.isFocusMode],
   );
 
   const allowSave = (hasContent || state.attachmentList.length > 0) && !state.isUploadingAttachment && !state.isRequesting;
@@ -481,10 +540,15 @@ const MemoEditor = observer((props: Props) => {
         memoName,
       }}
     >
+      {/* Focus Mode Backdrop */}
+      {state.isFocusMode && <div className={FOCUS_MODE_STYLES.backdrop} onClick={toggleFocusMode} />}
+
       <div
         className={cn(
-          "group relative w-full flex flex-col justify-start items-start bg-background px-4 pt-3 pb-2 rounded-lg border",
+          "group relative w-full flex flex-col justify-start items-start bg-card px-4 pt-3 pb-2 rounded-lg border",
+          FOCUS_MODE_STYLES.transition,
           state.isDraggingFile ? "border-dashed border-muted-foreground cursor-copy" : "border-border cursor-auto",
+          state.isFocusMode && cn(FOCUS_MODE_STYLES.container.base, FOCUS_MODE_STYLES.container.spacing),
           className,
         )}
         tabIndex={0}
@@ -496,59 +560,58 @@ const MemoEditor = observer((props: Props) => {
         onCompositionStart={handleCompositionStart}
         onCompositionEnd={handleCompositionEnd}
       >
+        {/* Focus Mode Exit Button */}
+        {state.isFocusMode && (
+          <Button
+            variant="ghost"
+            size="icon"
+            className={FOCUS_MODE_STYLES.exitButton}
+            onClick={toggleFocusMode}
+            title={t("editor.exit-focus-mode")}
+          >
+            <Minimize2Icon className="w-4 h-4" />
+          </Button>
+        )}
+
         <Editor ref={editorRef} {...editorConfig} />
-        <AttachmentListView attachmentList={state.attachmentList} setAttachmentList={handleSetAttachmentList} />
-        <RelationListView relationList={referenceRelations} setRelationList={handleSetRelationList} />
-        <div className="relative w-full flex flex-row justify-between items-center py-1 gap-2" onFocus={(e) => e.stopPropagation()}>
-          <div className="flex flex-row justify-start items-center opacity-60 shrink-1">
-            <TagSelector editorRef={editorRef} />
-            <MarkdownMenu editorRef={editorRef} />
-            <UploadAttachmentButton isUploading={state.isUploadingAttachment} />
-            <AddMemoRelationPopover />
-            <LocationSelector
+        <LocationDisplay
+          mode="edit"
+          location={state.location}
+          onRemove={() =>
+            setState((prevState) => ({
+              ...prevState,
+              location: undefined,
+            }))
+          }
+        />
+        <AttachmentList mode="edit" attachments={state.attachmentList} onAttachmentsChange={handleSetAttachmentList} />
+        <RelationList mode="edit" relations={referenceRelations} onRelationsChange={handleSetRelationList} />
+        <div className="relative w-full flex flex-row justify-between items-center pt-2 gap-2" onFocus={(e) => e.stopPropagation()}>
+          <div className="flex flex-row justify-start items-center gap-1">
+            <InsertMenu
+              isUploading={state.isUploadingAttachment}
               location={state.location}
-              onChange={(location) =>
+              onLocationChange={(location) =>
                 setState((prevState) => ({
                   ...prevState,
                   location,
                 }))
               }
+              onToggleFocusMode={toggleFocusMode}
             />
           </div>
-          <div className="shrink-0 -mr-1 flex flex-row justify-end items-center gap-1">
-            {props.onCancel && (
-              <Button variant="ghost" className="opacity-60" disabled={state.isRequesting} onClick={handleCancelBtnClick}>
-                {t("common.cancel")}
-              </Button>
-            )}
-            <Button disabled={!allowSave || state.isRequesting} onClick={handleSaveBtnClick}>
-              {t("editor.save")}
-              {!state.isRequesting ? (
-                <DropdownMenu>
-                  <DropdownMenuTrigger asChild onClick={(e) => e.stopPropagation()}>
-                    <span className="pointer-events-auto">
-                      <VisibilityIcon visibility={state.memoVisibility} className="w-4 h-auto ml-1 text-primary-foreground opacity-80" />
-                    </span>
-                  </DropdownMenuTrigger>
-                  <DropdownMenuContent align="end" alignOffset={-12} sideOffset={12} onClick={(e) => e.stopPropagation()}>
-                    <DropdownMenuItem onClick={() => handleMemoVisibilityChange(Visibility.PRIVATE)}>
-                      <VisibilityIcon visibility={Visibility.PRIVATE} className="w-4 h-4" />
-                      {t("memo.visibility.private")}
-                    </DropdownMenuItem>
-                    <DropdownMenuItem onClick={() => handleMemoVisibilityChange(Visibility.PROTECTED)}>
-                      <VisibilityIcon visibility={Visibility.PROTECTED} className="w-4 h-4" />
-                      {t("memo.visibility.protected")}
-                    </DropdownMenuItem>
-                    <DropdownMenuItem onClick={() => handleMemoVisibilityChange(Visibility.PUBLIC)}>
-                      <VisibilityIcon visibility={Visibility.PUBLIC} className="w-4 h-4" />
-                      {t("memo.visibility.public")}
-                    </DropdownMenuItem>
-                  </DropdownMenuContent>
-                </DropdownMenu>
-              ) : (
-                <LoaderIcon className="w-4 h-auto ml-1 animate-spin" />
+          <div className="shrink-0 flex flex-row justify-end items-center">
+            <VisibilitySelector value={state.memoVisibility} onChange={(visibility) => handleMemoVisibilityChange(visibility)} />
+            <div className="flex flex-row justify-end gap-1">
+              {props.onCancel && (
+                <Button variant="ghost" disabled={state.isRequesting} onClick={handleCancelBtnClick}>
+                  {t("common.cancel")}
+                </Button>
               )}
-            </Button>
+              <Button disabled={!allowSave || state.isRequesting} onClick={handleSaveBtnClick}>
+                {state.isRequesting ? <LoaderIcon className="w-4 h-4 animate-spin" /> : t("editor.save")}
+              </Button>
+            </div>
           </div>
         </div>
       </div>
