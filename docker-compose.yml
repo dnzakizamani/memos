@@ -1,0 +1,20 @@
+version: '3.8'
+
+services:
+  memos:
+    image: neosmemo/memos:latest
+    container_name: memos
+    restart: unless-stopped
+    ports:
+      - "5230:5230"
+    environment:
+      - MEMOS_DRIVER=postgres
+      - MEMOS_DSN=postgresql://your_db_username:your_db_password@your_vps_ip:5432/memos_db_name?sslmode=disable
+    volumes:
+      - ./memos_data:/var/opt/memos
+    networks:
+      - memos-network
+
+networks:
+  memos-network:
+    driver: bridge

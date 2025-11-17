@@ -1,0 +1,29 @@
+# Production Docker Compose for Memos with PostgreSQL
+
+version: '3.8'
+
+services:
+  memos:
+    image: neosmemo/memos:stable  # Using official image in production
+    container_name: memos
+    restart: unless-stopped
+    ports:
+      - "5230:5230"
+    environment:
+      - MEMOS_DRIVER=postgres
+      - MEMOS_DSN=postgresql://your_db_username:your_db_password@your_postgres_host:5432/memos_db_name?sslmode=disable
+    volumes:
+      - ./memos_data:/var/opt/memos
+    networks:
+      - memos-network
+    # Health check
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:5230/healthz"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+networks:
+  memos-network:
+    driver: bridge
